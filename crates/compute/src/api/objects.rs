@@ -6,10 +6,10 @@ use tonic::{Request, Response, Status};
 
 use enroute_api::api::v1alpha1::object_service_server::ObjectService;
 use enroute_api::api::v1alpha1::{
-    Commit, DiffCommitRequest, DiffCommitResponse, FileChange, FindMergeBasesRequest,
-    FindMergeBasesResponse, GetObjectRequest, GetObjectResponse, Identity, ListCommitsRequest,
-    ListCommitsResponse, ListTreeRequest, ListTreeResponse, ObjectHeader, ObjectKind, TreeEntry,
-    get_object_response,
+    Commit, ConflictedTree, DiffCommitRequest, DiffCommitResponse, FileChange,
+    FindMergeBasesRequest, FindMergeBasesResponse, GetObjectRequest, GetObjectResponse, Identity,
+    ListCommitsRequest, ListCommitsResponse, ListTreeRequest, ListTreeResponse, ObjectHeader,
+    ObjectKind, TreeEntry, get_object_response,
 };
 
 use crate::contract::wire::{parse_hex, parse_oid, require_oid, wire_oid, wire_time};
@@ -27,6 +27,21 @@ const DIFF_BATCH_CHANGES: usize = 1_000;
 /// Git's raw bytes as the contract's string.
 fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn conflict_tree(wire: i32) -> Result<Option<query::ConflictTree>, Status> {
+    Ok(match ConflictedTree::try_from(wire) {
+        Ok(ConflictedTree::Unspecified) => None,
+        Ok(ConflictedTree::AutoResolution) => Some(query::ConflictTree::AutoResolution),
+        Ok(ConflictedTree::Ours) => Some(query::ConflictTree::Ours),
+        Ok(ConflictedTree::Theirs) => Some(query::ConflictTree::Theirs),
+        Ok(ConflictedTree::Base) => Some(query::ConflictTree::Base),
+        Err(_) => {
+            return Err(Status::invalid_argument(format!(
+                "no conflicted tree {wire}"
+            )));
+        }
+    })
 }
 
 fn object_kind(kind: Kind) -> ObjectKind {
@@ -153,7 +168,11 @@ impl ObjectService for Api {
         let (_, snap) = self.snapshot(request.repo.as_ref()).await?;
         let oid = require_oid(request.commit_id.as_ref(), "commit_id")?;
         let base = request.base_commit_id.as_ref().map(parse_oid).transpose()?;
-        let diff = query::diff_commit(&snap, oid, base).await?;
+        let options = query::DiffOptions::new(
+            request.renames.map(|r| r.min_similarity_percent),
+            conflict_tree(request.conflicted_tree)?,
+        )?;
+        let diff = query::diff_commit(&snap, oid, base, &options).await?;
         let mut batches: Vec<DiffCommitResponse> = diff
             .changes
             .chunks(DIFF_BATCH_CHANGES)
@@ -164,18 +183,19 @@ impl ObjectService for Api {
                         path: lossy(&change.path),
                         old_object_id: change.old.map(wire_oid),
                         new_object_id: change.new.map(wire_oid),
+                        old_path: change.old_path.as_deref().map_or_default(lossy),
                     })
                     .collect(),
-                truncated: false,
+                ..Default::default()
             })
             .collect();
-        if diff.truncated {
-            match batches.last_mut() {
-                Some(last) => last.truncated = true,
-                None => batches.push(DiffCommitResponse {
-                    changes: Vec::new(),
-                    truncated: true,
-                }),
+        if diff.truncated || diff.renames_incomplete {
+            if batches.is_empty() {
+                batches.push(DiffCommitResponse::default());
+            }
+            if let Some(last) = batches.last_mut() {
+                last.truncated = diff.truncated;
+                last.renames_incomplete = diff.renames_incomplete;
             }
         }
         Ok(Response::new(streamed(batches)))

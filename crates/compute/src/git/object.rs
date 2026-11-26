@@ -15,8 +15,19 @@ pub(crate) struct Commit<'a> {
     pub parents: Vec<Oid>,
     pub author: Signature<'a>,
     pub committer: Signature<'a>,
+    headers: &'a [u8],
     /// Everything after the blank line that ends the headers.
     pub message: &'a [u8],
+}
+
+impl<'a> Commit<'a> {
+    /// The value of the first header named `name`, or of its first line when
+    /// the header continues onto more.
+    pub(crate) fn header(&self, name: &[u8]) -> Option<&'a [u8]> {
+        self.headers
+            .split(|&b| b == b'\n')
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(b" "))
+    }
 }
 
 /// Someone a commit names: `Name <email> 1700000000 +0100`.
@@ -132,6 +143,7 @@ pub(crate) fn parse_commit(data: &[u8]) -> Result<Commit<'_>> {
         committer: committer
             .and_then(Signature::parse)
             .context("commit without a committer")?,
+        headers,
         message,
     })
 }

@@ -212,6 +212,50 @@ message DiffCommitRequest {
   // and holds no opinion about how they are related, as `IsAncestor` reports
   // ancestry without imposing it.
   common.v1alpha1.ObjectId base_commit_id = 3;
+
+  // Pair a path the diff deletes with one it adds when their blobs are alike
+  // enough, as `git diff -M` does. Unset reports a rename as a delete and an
+  // add, which is what git stores.
+  RenameDetection renames = 4;
+
+  // Which tree to diff for a commit that GitButler holds conflicted, on each
+  // side that is one. Unspecified diffs every commit's root tree as stored.
+  //
+  // GitButler writes a conflicted commit with the conflict's trees added to
+  // its root tree, and marks it with a `GitButler-Conflict` trailer, or with
+  // a `gitbutler-conflicted` header before it wrote the trailer. A commit is
+  // read as GitButler reads it: conflicted when it is marked and its root tree
+  // holds at least one of those trees. Any other commit diffs as its root tree.
+  ConflictedTree conflicted_tree = 5;
+}
+
+// A tree that GitButler keeps in a conflicted commit, named as GitButler
+// names it.
+enum ConflictedTree {
+  CONFLICTED_TREE_UNSPECIFIED = 0;
+  // `.auto-resolution`: the conflict resolved in favor of ours, which is what
+  // GitButler shows as the commit's change.
+  CONFLICTED_TREE_AUTO_RESOLUTION = 1;
+  // `.conflict-side-0`: our side of the conflict.
+  CONFLICTED_TREE_OURS = 2;
+  // `.conflict-side-1`: their side of the conflict.
+  CONFLICTED_TREE_THEIRS = 3;
+  // `.conflict-base-0`: the merge base of the two sides.
+  CONFLICTED_TREE_BASE = 4;
+}
+
+// How `DiffCommit` pairs renames, which is how git pairs them: identical
+// blobs first, then a delete and an add whose base names are each unique on
+// their side, at a bar halfway between `min_similarity_percent` and 100,
+// then the most alike of the rest.
+//
+// Alike is git's own estimate, so a pair scores here what it scores in
+// `git diff -M`: the share of the larger blob's bytes that the other blob
+// also holds, compared a line at a time and in no order.
+message RenameDetection {
+  // How alike a pair must be, in percent, as `-M<n>%`. Zero is git's default
+  // of 50, and 100 pairs identical blobs only. Above 100 is refused.
+  uint32 min_similarity_percent = 1;
 }
 
 // One path this commit changed, as the pair of blobs at it.
@@ -231,6 +275,11 @@ message FileChange {
   // an add of the paths under it, because there is no pair of blobs to name.
   common.v1alpha1.ObjectId old_object_id = 2;
   common.v1alpha1.ObjectId new_object_id = 3;
+
+  // Where `old_object_id` was, set only for a rename: `path` is where
+  // `new_object_id` is now. Both ids are set, and are equal when the rename
+  // changed no content. Decoded as `path` is.
+  string old_path = 4;
 }
 
 // Changes arrive in batches, ordered by path across the whole answer.
@@ -244,10 +293,17 @@ message FileChange {
 // along, which is the history `ListCommits` walks. A commit with no parent
 // diffs against nothing, so every path in it is an add.
 //
-// No rename detection: git stores none, and a rename is a delete and an add
-// until somebody decides how alike is alike enough. `truncated` is set when
-// the diff stopped at the server's limit, as `ListTreeResponse.truncated` is.
+// Git stores no renames, so a rename is a delete and an add until
+// `DiffCommitRequest.renames` says how alike is alike enough. A rename is
+// one change, ordered by its new path.
+//
+// `truncated` is set when the diff stopped at the server's limit, as
+// `ListTreeResponse.truncated` is.
 message DiffCommitResponse {
   repeated FileChange changes = 1;
   bool truncated = 2;
+  // Set when rename detection stopped comparing contents at the server's
+  // limit. Identical blobs are still paired, but a delete and an add that are
+  // alike can arrive unpaired.
+  bool renames_incomplete = 3;
 }

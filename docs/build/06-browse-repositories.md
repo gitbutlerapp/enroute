@@ -324,9 +324,9 @@ object, using the ID from that listing.
 **A path is bytes, not text.** Git stores a filename as bytes, so an invalid
 UTF-8 sequence arrives with replacements rather than failing the listing.
 
-**There is no search, no blame, and no rename detection.** None of these is a
-question the contract answers. Each wants an index your app builds for itself
-out of the documented reads.
+**There is no search and no blame.** Neither is a question the contract
+answers. Each wants an index your app builds for itself out of the documented
+reads.
 
 **It hides nothing.** Every ref this lists is one the caller may already fetch.
 Deciding who sees what is the `visible_refs` hook.

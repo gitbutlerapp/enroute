@@ -102,8 +102,9 @@ this walk answer wrongly, with no warning.
 costs the listing that contains it, then `getObject` on the id that listing
 gave you.
 
-**There is no rename detection.** Git stores none, so a rename reads as a
-delete and an add until somebody decides how similar is similar enough.
+**Renames are paired only on request.** Git stores none, so a rename reads as
+a delete and an add unless `diffCommit` sets `renames`, which pairs them as
+`git diff -M` does. Check `renamesIncomplete` before calling a delete final.
 
 **There is no search and no blame.** Neither is a question the contract
 answers, and both want an index the application builds for itself out of

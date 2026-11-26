@@ -141,8 +141,9 @@ landed there since reads as a reversion.
 
 **Check `truncated` and `exhausted`.** `ListTree` and `DiffCommit` set
 `truncated` when they stopped at a server limit, and what arrived is then the
-first part of the answer. `FindMergeBases` sets `exhausted` to mean "unknown",
-not "no shared history".
+first part of the answer. `DiffCommit` sets `renames_incomplete` when rename
+detection stopped at its limit. `FindMergeBases` sets `exhausted` to mean
+"unknown", not "no shared history".
 
 ## Generating a client
 

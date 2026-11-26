@@ -119,6 +119,7 @@ so with a flag. Check the flag before you present a result as complete.
 | `ListCommits` | 100 commits per page | `next_page_token` |
 | `ListTree` | 50,000 entries | `truncated` |
 | `DiffCommit` | 50,000 changes, or 10,000 tree reads | `truncated` |
+| `DiffCommit` renames | 1,000 × 1,000 deletes and adds, or 256 MiB of compared content | `renames_incomplete` |
 | `FindMergeBases` | 250,000 commits walked | `exhausted` |
 | `CreateCommit` | 32 MiB per request | `OUT_OF_RANGE` |
 
@@ -720,6 +721,19 @@ each side.
 | `repo` | `RepoKey` | Required. The key of the repository. |
 | `commit_id` | `ObjectId` | Required. The commit to diff. |
 | `base_commit_id` | `ObjectId` | The commit to diff against. Unset means the first parent of `commit_id`. |
+| `renames` | `RenameDetection` | Pair deletes with adds as renames, as `git diff -M` does. Unset reports a rename as a delete and an add. |
+| `conflicted_tree` | `ConflictedTree` | Which tree to diff for a commit that GitButler holds conflicted, on each side that is one. Unspecified diffs every commit's root tree. |
+
+| `RenameDetection` field | Type | Description |
+| --- | --- | --- |
+| `min_similarity_percent` | `uint32` | How alike a delete and an add must be to pair, as `-M<n>%`. `0` means git's default of 50. `100` pairs identical blobs only. |
+
+| `ConflictedTree` value | Tree |
+| --- | --- |
+| `CONFLICTED_TREE_AUTO_RESOLUTION` | `.auto-resolution`: the conflict resolved in favor of ours, which GitButler shows as the change |
+| `CONFLICTED_TREE_OURS` | `.conflict-side-0` |
+| `CONFLICTED_TREE_THEIRS` | `.conflict-side-1` |
+| `CONFLICTED_TREE_BASE` | `.conflict-base-0` |
 
 The response is a stream of batches.
 
@@ -727,12 +741,14 @@ The response is a stream of batches.
 | --- | --- | --- |
 | `changes` | `FileChange[]` | The next batch of changes, ordered by path across the whole response. |
 | `truncated` | `bool` | The diff stopped at a limit. The changes sent are the first part of the answer, in path order. |
+| `renames_incomplete` | `bool` | Rename detection stopped comparing contents at a limit. Identical blobs are still paired, but a delete and an add that are alike can arrive unpaired. |
 
 | `FileChange` field | Type | Description |
 | --- | --- | --- |
 | `path` | `string` | The path from the root of the tree. |
 | `old_object_id` | `ObjectId` | The blob in the base. Unset when the commit adds the path. |
 | `new_object_id` | `ObjectId` | The blob in the commit. Unset when the commit deletes the path. |
+| `old_path` | `string` | Set only for a rename: the path of `old_object_id`. `path` is the path of `new_object_id`. |
 
 - **What a commit changed.** With no `base_commit_id`, the diff is against the
   first parent. A merge then shows what it landed on the branch, not
@@ -741,7 +757,18 @@ The response is a stream of batches.
 - **What a branch changed.** Diff the branch tip against its merge base with
   the target, from [`FindMergeBases`](#findmergebases). A diff against the
   target's tip shows the target's newer commits as reversed changes.
-- **No rename detection.** A rename is a delete and an add.
+- **Renames on request.** Git stores no renames, so without `renames` a
+  rename is a delete and an add. With `renames`, Enroute pairs them as
+  `git diff -M` does: identical blobs first, then files that keep their base
+  name, then the most alike of the rest. Similarity is git's own estimate, so a
+  pair scores what it scores in git. A rename is one change, at its new path.
+- **GitButler's conflicted commits.** GitButler adds a conflict's trees to the
+  commit's root tree and marks the commit with a `GitButler-Conflict` trailer,
+  or with a `gitbutler-conflicted` header in older commits. Set
+  `conflicted_tree` to `CONFLICTED_TREE_AUTO_RESOLUTION` to diff those commits
+  as GitButler shows them. Enroute reads a commit as conflicted the way
+  GitButler does: marked, with at least one conflict tree in its root tree.
+  Every other commit diffs as its root tree.
 - **Content only.** A change of mode alone, such as making a file executable,
   and a change to a submodule are not reported.
 - **File to directory.** A path that changed between a file and a directory
@@ -752,6 +779,7 @@ The response is a stream of batches.
 | Status | Cause |
 | --- | --- |
 | `INVALID_ARGUMENT` | `commit_id` or `base_commit_id` is not a commit |
+| `INVALID_ARGUMENT` | `min_similarity_percent` is over 100, `conflicted_tree` is not a value listed here, or a conflicted commit lacks the tree that `conflicted_tree` names |
 
 ```sh
 grpcurl -plaintext -d '{

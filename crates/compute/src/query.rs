@@ -11,7 +11,9 @@
 //!   the push numbered them in (bases from different pushes keep push order).
 
 mod commit;
+mod conflicted;
 mod refs;
+mod renames;
 
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use std::fmt;
@@ -27,7 +29,11 @@ use crate::repo::machine::peel as read_peeled;
 use crate::repo::serve::{FetchArgs, Plan, Sink, plan, write_pack};
 use crate::repo::view::{DenseId, Snapshot};
 
+use self::conflicted::Layout;
+use self::renames::Similarity;
+
 pub(crate) use self::commit::{Expected, FileMode, NewCommit, PathChange, PathEdit, create_commit};
+pub(crate) use self::conflicted::ConflictTree;
 pub(crate) use self::refs::RefView;
 
 /// Commits in one history page, at most.
@@ -418,6 +424,8 @@ pub(crate) struct FileChange {
     pub old: Option<Oid>,
     /// The blob after; `None` when the path is gone.
     pub new: Option<Oid>,
+    /// Where `old` was, for a rename.
+    pub old_path: Option<Vec<u8>>,
 }
 
 /// The files that differ between two commits.
@@ -427,21 +435,57 @@ pub(crate) struct CommitDiff {
     pub changes: Vec<FileChange>,
     /// The diff stopped at a limit, so `changes` is a prefix of the answer.
     pub truncated: bool,
+    /// Rename detection stopped comparing contents at a limit.
+    pub renames_incomplete: bool,
+}
+
+/// What a diff reads and pairs beyond its two commits.
+#[derive(Debug, Clone)]
+pub(crate) struct DiffOptions {
+    renames: Option<Similarity>,
+    conflict_tree: Option<ConflictTree>,
+}
+
+impl DiffOptions {
+    /// Pair renames at least `renames` percent alike (zero is git's default),
+    /// and diff the `conflict_tree` of a commit `GitButler` holds conflicted.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a percentage over 100.
+    pub(crate) fn new(
+        renames: Option<u32>,
+        conflict_tree: Option<ConflictTree>,
+    ) -> Result<Self, Error> {
+        let renames = renames
+            .map(|percent| {
+                Similarity::from_percent(percent).ok_or_else(|| {
+                    Error::Invalid(format!("a similarity of {percent}% is over 100%"))
+                })
+            })
+            .transpose()?;
+        Ok(DiffOptions {
+            renames,
+            conflict_tree,
+        })
+    }
 }
 
 /// The files that differ between `commit` and `base`, or its first parent
 /// when there is no base (a root commit is diffed against nothing).
 ///
-/// No renames, gitlinks or mode-only changes; a path that turns from file to
-/// directory, or back, is both a removal and an addition.
+/// No gitlinks or mode-only changes; a path that turns from file to directory,
+/// or back, is both a removal and an addition.
 ///
 /// # Errors
 ///
-/// `commit` or `base` is not a stored commit, or a read failed.
+/// `commit` or `base` is not a stored commit, a conflicted one lacks the
+/// tree asked for, or a read failed.
 pub(crate) async fn diff_commit(
     snap: &Arc<Snapshot>,
     commit: Oid,
     base: Option<Oid>,
+    options: &DiffOptions,
 ) -> Result<CommitDiff, Error> {
     const OF: &str = "a diff is of a commit";
     let older = if let Some(base) = base {
@@ -462,13 +506,51 @@ pub(crate) async fn diff_commit(
         }
         walked.get(1).map(|d| snap.oid(*d))
     };
-    let new_root = commit_tree(snap, commit).await?;
+    let new_root = diffed_tree(snap, commit, options.conflict_tree).await?;
     let old_root = match older {
-        Some(o) => Some(commit_tree(snap, o).await?),
+        Some(o) => Some(diffed_tree(snap, o, options.conflict_tree).await?),
         None => None,
     };
     let diff = diff_trees(snap, old_root, new_root).await?;
-    Ok(changed_files(diff))
+    let complete = diff.unreadable.is_empty();
+    let files = changed_files(diff);
+    let (changes, renames_incomplete) = match options.renames {
+        Some(min) => {
+            let renamed = renames::pair(snap, files, min).await?;
+            (renamed.changes, renamed.incomplete)
+        }
+        None => (files, false),
+    };
+    Ok(in_path_order(changes, complete, renames_incomplete))
+}
+
+/// The tree a diff reads for `commit`: its `conflict_tree` when `GitButler`
+/// holds it conflicted, else its root tree.
+async fn diffed_tree(
+    snap: &Arc<Snapshot>,
+    commit: Oid,
+    conflict_tree: Option<ConflictTree>,
+) -> Result<Oid, Error> {
+    let d = snap
+        .lookup_kind(&commit, Kind::Commit)
+        .with_context(|| format!("commit {commit} missing"))?;
+    let data = snap.load(d).await?;
+    let parsed = parse_commit(&data)?;
+    let root = parsed.tree;
+    let Some(kind) = conflict_tree.filter(|_| conflicted::is_marked(&parsed)) else {
+        return Ok(root);
+    };
+    let tree = snap
+        .lookup_kind(&root, Kind::Tree)
+        .with_context(|| format!("tree {root} is missing"))?;
+    match conflicted::layout(&children(snap.format(), &snap.load(tree).await?), kind) {
+        Layout::Ordinary => Ok(root),
+        Layout::Conflicted(Some(chosen)) => Ok(chosen),
+        Layout::Conflicted(None) => Err(Error::Invalid(format!(
+            "{commit} is conflicted and has no {} tree",
+            kind.entry_name()
+        ))),
+    }
 }
 
 /// The root tree of a stored commit.
@@ -635,9 +717,8 @@ fn removed(
     out.removals.push((path, entry.is_tree, entry.oid));
 }
 
-/// The files of a diff, sorted, then cut at the change limit.
-fn changed_files(diff: TreeDiff) -> CommitDiff {
-    let complete = diff.unreadable.is_empty();
+/// The files of a diff, in no order.
+fn changed_files(diff: TreeDiff) -> Vec<FileChange> {
     let added = diff
         .changes
         .into_iter()
@@ -646,6 +727,7 @@ fn changed_files(diff: TreeDiff) -> CommitDiff {
             path,
             old,
             new: Some(new),
+            old_path: None,
         });
     let gone = diff
         .removals
@@ -655,13 +737,26 @@ fn changed_files(diff: TreeDiff) -> CommitDiff {
             path,
             old: Some(old),
             new: None,
+            old_path: None,
         });
-    let mut changes: Vec<FileChange> = added.chain(gone).collect();
+    added.chain(gone).collect()
+}
+
+/// A diff's files sorted, then cut at the change limit.
+fn in_path_order(
+    mut changes: Vec<FileChange>,
+    complete: bool,
+    renames_incomplete: bool,
+) -> CommitDiff {
     // The API sends paths as strings, and sorted them as strings.
     changes.sort_by_cached_key(|c| String::from_utf8_lossy(&c.path).into_owned());
     let truncated = changes.len() > DIFF_CHANGE_LIMIT || !complete;
     changes.truncate(DIFF_CHANGE_LIMIT);
-    CommitDiff { changes, truncated }
+    CommitDiff {
+        changes,
+        truncated,
+        renames_incomplete,
+    }
 }
 
 /// `name` under `prefix`.

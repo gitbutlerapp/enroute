@@ -1,6 +1,8 @@
 //! What a commit changed, and what landed before it.
 
-use crate::contract::{Client, hex, hexes};
+use enroute_api::api::v1alpha1::{ConflictedTree, DiffCommitRequest, FileChange, RenameDetection};
+
+use crate::contract::{Client, hex, hexes, oid, repo_key};
 use crate::support::{Scratch, Stack, git};
 
 use super::support::{
@@ -66,6 +68,353 @@ async fn a_commit_diffs_against_its_parent() {
     // The new side is the blob git has at that path, not merely some id.
     let blob = git(&["rev-parse", "HEAD:a.txt"], Some(&local)).await;
     assert_eq!(hex(changes[0].new_object_id.as_ref()), blob.trim());
+}
+
+/// A change as `git diff-tree --name-status` prints it, less the score.
+fn name_status(change: &FileChange) -> String {
+    let status = match (&change.old_object_id, &change.new_object_id) {
+        _ if !change.old_path.is_empty() => format!("R\t{}", change.old_path),
+        (None, _) => "A".into(),
+        (_, None) => "D".into(),
+        _ => "M".into(),
+    };
+    format!("{status}\t{}", change.path)
+}
+
+/// Renames pair as `git diff -M` pairs them, at each bar a caller can set.
+///
+/// One of each way a pair is found: an identical blob, an edited file that
+/// keeps its base name, and an edited file that changes it.
+#[tokio::test]
+async fn renames_pair_as_git_pairs_them() {
+    let (client, id, _tmp, local, _servers) = pushed_repo_serving("first\n").await;
+    let body = |name: &str, line_five: &str| -> String {
+        (0..20)
+            .map(|i| match i {
+                5 => format!("{name} {line_five}\n"),
+                _ => format!("{name} line {i}\n"),
+            })
+            .collect()
+    };
+    let put = |path: &str, content: String| {
+        let path = local.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    put("src/moved.txt", body("moved", "as it was"));
+    put("docs/guide.md", body("guide", "as it was"));
+    put("old-name.txt", body("named", "as it was"));
+    put("gone.txt", "gone\n".into());
+    git(&["add", "-A"], Some(&local)).await;
+    git(&["commit", "-m", "before"], Some(&local)).await;
+
+    for gone in ["src/moved.txt", "docs/guide.md", "old-name.txt", "gone.txt"] {
+        std::fs::remove_file(local.join(gone)).unwrap();
+    }
+    put("lib/moved.txt", body("moved", "as it was"));
+    put("manual/guide.md", body("guide", "edited"));
+    put("new-name.txt", body("named", "edited"));
+    put("fresh.txt", "fresh\n".into());
+    git(&["add", "-A"], Some(&local)).await;
+    git(&["commit", "-m", "after"], Some(&local)).await;
+    git(&["push", "origin", "main"], Some(&local)).await;
+    let head = git(&["rev-parse", "HEAD"], Some(&local)).await;
+
+    for (renames, flag) in [
+        (None, "--no-renames"),
+        (Some(0), "-M"),
+        (Some(100), "-M100%"),
+    ] {
+        let diff = client
+            .diff(DiffCommitRequest {
+                repo: Some(repo_key(&id)),
+                commit_id: oid(head.trim()),
+                renames: renames.map(|min_similarity_percent| RenameDetection {
+                    min_similarity_percent,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !diff.truncated && !diff.renames_incomplete,
+            "a diff this small is whole"
+        );
+        let mut ours: Vec<String> = diff.changes.iter().map(name_status).collect();
+        ours.sort_unstable();
+
+        let printed = git(
+            &[
+                "diff-tree",
+                "-r",
+                flag,
+                "--name-status",
+                "--no-commit-id",
+                head.trim(),
+            ],
+            Some(&local),
+        )
+        .await;
+        let mut theirs: Vec<String> = printed
+            .lines()
+            .filter_map(|line| {
+                let (status, paths) = line.split_once('\t')?;
+                Some(format!("{}\t{paths}", status.chars().next()?))
+            })
+            .collect();
+        theirs.sort_unstable();
+        assert_eq!(ours, theirs, "git diff-tree {flag} pairs the same paths");
+    }
+}
+
+/// The commits [`a_conflicted_commit_diffs_as_the_tree_asked_for`] reads.
+struct Conflicts {
+    by_trailer: String,
+    by_header: String,
+    ordinary: String,
+    copied_marker: String,
+    lookalike: String,
+    malformed: String,
+}
+
+/// Commit each of [`Conflicts`] onto `local`'s `main`, oldest first, and push
+/// them.
+async fn conflicted_history(local: &std::path::Path) -> Conflicts {
+    let put = |path: &str, content: &str| {
+        let path = local.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    let conflict_trees = [
+        ".auto-resolution",
+        ".conflict-side-0",
+        ".conflict-side-1",
+        ".conflict-base-0",
+    ];
+    let lay_out_conflict = |resolved: &str, ours: &str| {
+        put("a.txt", resolved);
+        for (tree, content) in conflict_trees
+            .iter()
+            .zip([resolved, ours, "theirs\n", "first\n"])
+        {
+            put(&format!("{tree}/a.txt"), content);
+        }
+        put(".conflict-files", "ourEntries = [\"a.txt\"]\n");
+    };
+    let commit = async |args: &[&str]| -> String {
+        git(&["add", "-A"], Some(local)).await;
+        git(&[&["commit"][..], args].concat(), Some(local)).await;
+        git(&["rev-parse", "HEAD"], Some(local))
+            .await
+            .trim()
+            .to_owned()
+    };
+
+    lay_out_conflict("resolved\n", "ours\n");
+    let by_trailer = commit(&[
+        "-m",
+        "[conflict] by trailer",
+        "-m",
+        "GitButler-Conflict: yes",
+    ])
+    .await;
+
+    lay_out_conflict("resolved again\n", "ours again\n");
+    git(&["add", "-A"], Some(local)).await;
+    let tree = git(&["write-tree"], Some(local)).await;
+    let raw = local.join(".git/by-header");
+    std::fs::write(
+        &raw,
+        format!(
+            "tree {}\nparent {by_trailer}\n\
+             author A <a@example.com> 1700000000 +0000\n\
+             committer A <a@example.com> 1700000000 +0000\n\
+             gitbutler-headers-version 2\ngitbutler-conflicted 1\n\nby header\n",
+            tree.trim()
+        ),
+    )
+    .unwrap();
+    let written = git(
+        &["hash-object", "-t", "commit", "-w", raw.to_str().unwrap()],
+        Some(local),
+    )
+    .await;
+    let by_header = written.trim().to_owned();
+    git(&["update-ref", "HEAD", &by_header], Some(local)).await;
+
+    for tree in conflict_trees {
+        std::fs::remove_dir_all(local.join(tree)).unwrap();
+    }
+    std::fs::remove_file(local.join(".conflict-files")).unwrap();
+    put("b.txt", "b\n");
+    let ordinary = commit(&["-m", "ordinary"]).await;
+
+    put("b.txt", "b, edited\n");
+    let copied_marker = commit(&["-m", "copied", "-m", "GitButler-Conflict: yes"]).await;
+
+    put(".auto-resolution/a.txt", "a lookalike\n");
+    let lookalike = commit(&["-m", "a lookalike"]).await;
+
+    std::fs::remove_dir_all(local.join(".auto-resolution")).unwrap();
+    put(".conflict-side-0/a.txt", "ours\n");
+    let malformed = commit(&["-m", "malformed", "-m", "GitButler-Conflict: yes"]).await;
+    git(&["push", "origin", "main"], Some(local)).await;
+
+    Conflicts {
+        by_trailer,
+        by_header,
+        ordinary,
+        copied_marker,
+        lookalike,
+        malformed,
+    }
+}
+
+/// A commit `GitButler` holds conflicted diffs as the tree of its conflict
+/// asked for, on each side, and every other commit as its root tree.
+///
+/// Marked both ways `GitButler` has marked one: the trailer it writes now, and
+/// the header it wrote before.
+#[tokio::test]
+async fn a_conflicted_commit_diffs_as_the_tree_asked_for() {
+    let (client, id, _tmp, local, _servers) = pushed_repo_serving("first\n").await;
+    let Conflicts {
+        by_trailer,
+        by_header,
+        ordinary,
+        copied_marker,
+        lookalike,
+        malformed,
+    } = conflicted_history(&local).await;
+
+    let diff = async |commit: &str, tree: ConflictedTree| {
+        client
+            .diff(DiffCommitRequest {
+                repo: Some(repo_key(&id)),
+                commit_id: oid(commit),
+                conflicted_tree: tree.into(),
+                ..Default::default()
+            })
+            .await
+            .map(|diff| diff.changes)
+    };
+    let blob = async |spec: String| {
+        git(&["rev-parse", &spec], Some(&local))
+            .await
+            .trim()
+            .to_owned()
+    };
+    let sides = |changes: &[FileChange]| -> Vec<(String, String, String)> {
+        changes
+            .iter()
+            .map(|c| {
+                let (old, new) = (c.old_object_id.as_ref(), c.new_object_id.as_ref());
+                (c.path.clone(), hex(old), hex(new))
+            })
+            .collect()
+    };
+    let as_git_diffs = async |commit: &str| -> Vec<String> {
+        let printed = git(
+            &["diff-tree", "-r", "--name-only", "--no-commit-id", commit],
+            Some(&local),
+        )
+        .await;
+        let mut paths: Vec<String> = printed.lines().map(str::to_owned).collect();
+        paths.sort_unstable();
+        paths
+    };
+    let auto = ConflictedTree::AutoResolution;
+
+    assert_eq!(
+        sides(&diff(&by_trailer, auto).await.unwrap()),
+        [(
+            "a.txt".into(),
+            blob(format!("{by_trailer}~1:a.txt")).await,
+            blob(format!("{by_trailer}:.auto-resolution/a.txt")).await,
+        )],
+        "the resolution, against an ordinary parent"
+    );
+    for (tree, name) in [
+        (auto, ".auto-resolution"),
+        (ConflictedTree::Ours, ".conflict-side-0"),
+    ] {
+        assert_eq!(
+            sides(&diff(&by_header, tree).await.unwrap()),
+            [(
+                "a.txt".into(),
+                blob(format!("{by_trailer}:{name}/a.txt")).await,
+                blob(format!("{by_header}:{name}/a.txt")).await,
+            )],
+            "{name} on both sides, each marked its own way"
+        );
+    }
+    let paths =
+        |changes: Vec<FileChange>| -> Vec<String> { changes.into_iter().map(|c| c.path).collect() };
+    assert_eq!(
+        paths(diff(&ordinary, auto).await.unwrap()),
+        ["b.txt"],
+        "a.txt is what the conflicted parent resolved to"
+    );
+    for (commit, why) in [
+        (&copied_marker, "a marker with no conflict trees"),
+        (&lookalike, "conflict trees with no marker"),
+    ] {
+        assert_eq!(
+            paths(diff(commit, auto).await.unwrap()),
+            as_git_diffs(commit).await,
+            "{why} is an ordinary commit"
+        );
+    }
+    assert_eq!(
+        paths(diff(&by_header, ConflictedTree::Unspecified).await.unwrap()),
+        as_git_diffs(&by_header).await,
+        "no tree asked for diffs the root trees, as git does"
+    );
+
+    let error = diff(&malformed, auto).await.expect_err("no tree to diff");
+    assert_eq!(
+        status_of(&error).code(),
+        tonic::Code::InvalidArgument,
+        "a conflict without the tree asked for: {error:?}"
+    );
+}
+
+/// A bar above identical, and a tree the contract does not name, are refused
+/// rather than read as something nearby.
+#[tokio::test]
+async fn diff_options_with_no_meaning_are_refused() {
+    let (client, id, _tmp, local) = pushed_repo("first\n").await;
+    let head = git(&["rev-parse", "HEAD"], Some(&local)).await;
+    let request = || DiffCommitRequest {
+        repo: Some(repo_key(&id)),
+        commit_id: oid(head.trim()),
+        ..Default::default()
+    };
+    for (what, refused) in [
+        (
+            "more alike than identical",
+            DiffCommitRequest {
+                renames: Some(RenameDetection {
+                    min_similarity_percent: 101,
+                }),
+                ..request()
+            },
+        ),
+        (
+            "a conflicted tree the contract does not name",
+            DiffCommitRequest {
+                conflicted_tree: 99,
+                ..request()
+            },
+        ),
+    ] {
+        let error = client.diff(refused).await.expect_err(what);
+        assert_eq!(
+            status_of(&error).code(),
+            tonic::Code::InvalidArgument,
+            "{what}: {error:?}"
+        );
+    }
 }
 
 /// A commit with no parent has nothing to diff against, so everything in
@@ -389,7 +738,7 @@ async fn a_diff_reads_against_the_base_it_is_given() {
     stack.seed(&repo, TRUNK, &scratch, &landed).await;
     stack.seed(&repo, "refs/heads/mine", &scratch, &mine).await;
 
-    let older = |changes: Vec<enroute_api::api::v1alpha1::FileChange>| {
+    let older = |changes: Vec<FileChange>| {
         assert_eq!(changes.len(), 1, "one path, written by every commit here");
         hex(changes[0].old_object_id.as_ref())
     };

@@ -21,9 +21,9 @@ use enroute_api::api::v1alpha1::repository_service_client::RepositoryServiceClie
 use enroute_api::api::v1alpha1::sync_service_client::SyncServiceClient;
 use enroute_api::api::v1alpha1::{
     Commit, CreateCommitRequest, CreateCommitResponse, CreateRepositoryRequest,
-    DeleteRepositoryRequest, DiffCommitRequest, FetchFromRemoteRequest, FileChange,
-    FindMergeBasesRequest, FindMergeBasesResponse, GetObjectRequest, GetRepositoryRequest,
-    IsAncestorRequest, ListCommitsRequest, ListRefsRequest, ListRefsResponse,
+    DeleteRepositoryRequest, DiffCommitRequest, DiffCommitResponse, FetchFromRemoteRequest,
+    FileChange, FindMergeBasesRequest, FindMergeBasesResponse, GetObjectRequest,
+    GetRepositoryRequest, IsAncestorRequest, ListCommitsRequest, ListRefsRequest, ListRefsResponse,
     ListRepositoriesRequest, ListTreeRequest, ObjectFormat, ObjectKind, PushToRemoteRequest,
     RefFetchOutcome, RefPushOutcome, RefSpec, RefUpdate, Remote, Repository, TreeEntry,
     UpdateRefsRequest, get_object_response,
@@ -467,23 +467,39 @@ impl Client {
         object_id: &str,
         base: &str,
     ) -> Result<Vec<FileChange>> {
-        let mut stream = self
-            .objects
-            .clone()
-            .diff_commit(DiffCommitRequest {
+        let diff = self
+            .diff(DiffCommitRequest {
                 repo: Some(repo_key(repo)),
                 commit_id: oid(object_id),
                 base_commit_id: oid(base),
+                ..Default::default()
             })
+            .await?;
+        Ok(diff.changes)
+    }
+
+    /// The diff `request` asks for, with its batches and their flags folded
+    /// into one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the call fails.
+    pub(crate) async fn diff(&self, request: DiffCommitRequest) -> Result<DiffCommitResponse> {
+        let mut stream = self
+            .objects
+            .clone()
+            .diff_commit(request)
             .await
             .context("calling diff_commit")?
             .into_inner();
 
-        let mut changes = Vec::new();
+        let mut whole = DiffCommitResponse::default();
         while let Some(batch) = stream.message().await? {
-            changes.extend(batch.changes);
+            whole.changes.extend(batch.changes);
+            whole.truncated |= batch.truncated;
+            whole.renames_incomplete |= batch.renames_incomplete;
         }
-        Ok(changes)
+        Ok(whole)
     }
 
     /// Every path under a commit or a tree, and whether the walk was cut short.
